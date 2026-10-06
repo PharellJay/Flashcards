@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "folders": [
+    {
+      "id": "root",
+      "name": "/",
+      "parent_id": null,
+      "children": [
+        "32fa242e024b"
+      ],
+      "cards": []
+    },
+    {
+      "id": "32fa242e024b",
+      "name": "Mathe",
+      "parent_id": "root",
+      "children": [],
+      "cards": [
+        "ff498a876aa6"
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "id": "ff498a876aa6",
+      "folder_id": "32fa242e024b",
+      "front": "1+1 = ?",
+      "back": "2",
+      "due": false
+    }
+  ]
+}
