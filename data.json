@@ -16,7 +16,8 @@
       "parent_id": "root",
       "children": [],
       "cards": [
-        "ff498a876aa6"
+        "ff498a876aa6",
+        "caad4ae49b73"
       ]
     }
   ],
@@ -27,6 +28,13 @@
       "front": "1+1 = ?",
       "back": "2",
       "due": false
+    },
+    {
+      "id": "caad4ae49b73",
+      "folder_id": "32fa242e024b",
+      "front": "1 + 2 = ?",
+      "back": "3",
+      "due": true
     }
   ]
 }
