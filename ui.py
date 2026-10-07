@@ -9,6 +9,7 @@ from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Center, Grid, Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
@@ -234,6 +235,67 @@ class FolderPicker(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class ActionMenu(ModalScreen[str | None]):
+    """A small menu of actions. Items are (action, label, key, enabled); returns the action."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, title: str, items: list[tuple[str, str, str, bool]]) -> None:
+        super().__init__()
+        self.menu_title = title
+        self.items = items
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog menu"):
+            yield Label(self.menu_title, classes="dialog-title")
+            yield OptionList(
+                *(
+                    Option(Text.assemble(label, (f"  {key}", "dim")), id=action, disabled=not enabled)
+                    for action, label, key, enabled in self.items
+                ),
+                id="menu",
+            )
+
+    def on_click(self, event: events.Click) -> None:
+        if event.widget is self:  # clicked outside the menu
+            self.dismiss(None)
+
+    @on(OptionList.OptionSelected)
+    def chosen(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(event.option.id)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ---------------------------------------------------------------- right-click menus
+
+
+class FolderTree(Tree[str]):
+    """Folder tree where right-clicking a folder opens its options menu."""
+
+    def _on_click(self, event: events.Click) -> None:
+        if event.button == 3:
+            event.prevent_default()
+            if "line" in event.style.meta:
+                self.cursor_line = event.style.meta["line"]
+            self.focus()
+            self.call_after_refresh(self.app.action_options)
+
+
+class CardList(OptionList):
+    """Card list where right-clicking a card opens its options menu (not the editor)."""
+
+    def _on_click(self, event: events.Click) -> None:
+        if event.button == 3:
+            event.prevent_default()
+            index = event.style.meta.get("option")
+            if index is not None and not self.get_option_at_index(index).disabled:
+                self.highlighted = index
+            self.focus()
+            self.call_after_refresh(self.app.action_options)
+
+
 # ---------------------------------------------------------------- study
 
 
@@ -368,10 +430,9 @@ class FlashcardApp(App[None]):
     #main { height: 1fr; }
     #left { width: 40%; min-width: 28; }
     #folders { height: 1fr; border: round $primary-darken-2; }
-    .toolbar { height: auto; grid-size: 2; grid-rows: 3; grid-gutter: 0 1; padding: 0 1; }
+    .toolbar { height: auto; grid-size: 1; grid-rows: 3; grid-gutter: 0 1; padding: 0 1; }
+    #study-bar { grid-size: 3; }
     .toolbar Button { width: 1fr; min-width: 0; }
-    /* wide terminals: study and card actions each fit on a single row */
-    Screen.-wide #study-bar, Screen.-wide #card-bar { grid-size: 4; }
     /* short terminals: compact one-line buttons so the card list keeps its space */
     Screen.-short .toolbar { grid-rows: 1; grid-gutter: 1 1; margin-bottom: 1; }
     #folders:focus-within { border: round $accent; }
@@ -387,6 +448,8 @@ class FlashcardApp(App[None]):
         padding: 1 2; border: thick $accent; background: $surface;
     }
     .dialog.wide { width: 80; }
+    .dialog.menu { width: 40; }
+    #menu { height: auto; max-height: 20; border: none; padding: 0; }
     .dialog-title { width: 100%; text-style: bold; margin-bottom: 1; }
     .dialog #picker { height: auto; max-height: 20; }
     .card-text { height: 6; }
@@ -408,18 +471,21 @@ class FlashcardApp(App[None]):
     #grades Button { margin: 0 1; }
     """
 
+    # the footer lists the keys for the main-page buttons; folder/card actions (rename, move,
+    # edit, delete) live in the options menu (o / right-click) and keep hidden shortcuts
     BINDINGS = [
-        Binding("n", "create_folder", "Create folder"),
-        Binding("r", "rename_folder", "Rename"),
-        Binding("m", "move_folder", "Move folder"),
-        Binding("a", "add_card", "Add card"),
-        Binding("e", "edit_card", "Edit card"),
-        Binding("M", "move_card", "Move card"),
-        Binding("d", "delete", "Delete"),
-        Binding("s", "study", "Study due"),
+        Binding("s", "study", "Study"),
         Binding("c", "cram", "Cram"),
-        Binding("f5", "make_due", "Refresh folder"),
-        Binding("R", "make_all_due", "Refresh all"),
+        Binding("f,f5", "make_due", "Refresh", key_display="f"),
+        Binding("a", "add_card", "Add card"),
+        Binding("n", "create_folder", "New folder"),
+        Binding("o", "options", "Options"),
+        Binding("r", "rename_folder", "Rename", show=False),
+        Binding("m", "move_folder", "Move folder", show=False),
+        Binding("e", "edit_card", "Edit card", show=False),
+        Binding("M", "move_card", "Move card", show=False),
+        Binding("d", "delete", "Delete", show=False),
+        Binding("R", "make_all_due", "Refresh all", show=False),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -444,30 +510,24 @@ class FlashcardApp(App[None]):
         yield Header()
         with Horizontal(id="main"):
             with Vertical(id="left"):
-                tree: Tree[str] = Tree("All folders", data=ROOT_ID, id="folders")
+                tree = FolderTree("All folders", data=ROOT_ID, id="folders")
                 tree.border_title = "Folders"
                 tree.auto_expand = False
                 yield tree
                 with Grid(id="folder-bar", classes="toolbar"):
-                    yield self._tool("+ New folder", "create_folder", "Create a folder (n)", "primary")
-                    yield self._tool("✎ Rename", "rename_folder", "Rename this folder (r)")
-                    yield self._tool("→ Move", "move_folder", "Move this folder somewhere else (m)")
-                    yield self._tool("✕ Delete", "delete_folder", "Delete this folder and everything in it (d)", "error")
+                    yield self._tool("+ New folder", "create_folder", "Create a folder (n)")
+                    yield self._tool("⋯ Options", "options", "More actions for the selected folder or card (o / right-click)")
             with Vertical(id="right"):
                 yield Static(id="info")
                 with Grid(id="study-bar", classes="toolbar"):
                     yield self._tool("▶ Study", "study", "Review the cards that are due (s)", "success")
-                    yield self._tool("⟳ Cram all", "cram", "Go through every card, shuffled (c)")
-                    yield self._tool("↻ Refresh", "make_due", "Make every card in this folder due again (F5)")
-                    yield self._tool("↻ Refresh all", "make_all_due", "Make every card in every folder due again (R)")
-                cards = OptionList(id="cards")
+                    yield self._tool("⟳ Cram", "cram", "Go through every card, shuffled (c)")
+                    yield self._tool("↻ Refresh", "make_due", "Make the cards here due again (f)")
+                cards = CardList(id="cards")
                 cards.border_title = "Cards (this folder)"
                 yield cards
                 with Grid(id="card-bar", classes="toolbar"):
                     yield self._tool("+ Add card", "add_card", "Add a card to this folder (a)", "primary")
-                    yield self._tool("✎ Edit", "edit_card", "Edit the highlighted card (e / enter)")
-                    yield self._tool("→ Move", "move_card", "Move the highlighted card to another folder (M)")
-                    yield self._tool("✕ Delete", "delete_card", "Delete the highlighted card (d in card list)", "error")
                 preview = Static(id="preview")
                 preview.border_title = "Preview"
                 yield preview
@@ -584,26 +644,26 @@ class FlashcardApp(App[None]):
                 Text.assemble(("Front: ", "bold"), card.front, "\n", ("Back:  ", "bold"), card.back)
                 + Text("\ndue" if card.due else "\ndone — refresh to study it again", style="dim")
             )
-        has_card = card is not None
-        for action in ("edit_card", "move_card", "delete_card"):
-            self.query_one(f"#btn-{action}", Button).disabled = not has_card
 
     def update_folder_buttons(self, folder_id: str, due: int, total: int) -> None:
-        """Enable only the folder/study buttons that make sense for the selected folder."""
-        for action in ("rename_folder", "move_folder", "delete_folder", "add_card"):
+        """Enable only the buttons that make sense for the selected folder."""
+        for action in ("add_card", "options"):
             self.query_one(f"#btn-{action}", Button).disabled = folder_id == ROOT_ID
         study = self.query_one("#btn-study", Button)
         study.label = f"▶ Study ({due} due)"
         study.disabled = due == 0
         self.query_one("#btn-cram", Button).disabled = total == 0
         self.query_one("#btn-make_due", Button).disabled = due == total
-        all_due, all_total = self.store.counts(ROOT_ID)
-        self.query_one("#btn-make_all_due", Button).disabled = all_due == all_total
+        self.refresh_bindings()  # the footer dims keys whose button is disabled
 
     def _try(self, fn, *args):
-        """Run a store operation; show its error and return None if it fails."""
+        """Run a store operation; show its error and return None if it fails.
+
+        Operations that return nothing give True, so success is always truthy.
+        """
         try:
-            return fn(*args)
+            result = fn(*args)
+            return True if result is None else result
         except StoreError as exc:
             self.notify(str(exc), severity="error")
             return None
@@ -740,6 +800,35 @@ class FlashcardApp(App[None]):
             done,
         )
 
+    # ----- options menu
+
+    def action_options(self) -> None:
+        """Open the menu for the highlighted card (in the card list) or the selected folder."""
+        card = self.selected_card()
+        if self.focused is self.card_list and card is not None:
+            title = f"Card: {_one_line(card.front, 30)}"
+            items = [
+                ("edit_card", "✎ Edit", "e", True),
+                ("move_card", "→ Move to…", "M", True),
+                ("delete_card", "✕ Delete", "d", True),
+            ]
+        else:
+            fid = self.selected_folder()
+            if fid == ROOT_ID:
+                return  # "All folders" can't be renamed, moved or deleted
+            title = f"Folder: {self.store.path_of(fid)}"
+            items = [
+                ("rename_folder", "✎ Rename", "r", True),
+                ("move_folder", "→ Move to…", "m", True),
+                ("delete_folder", "✕ Delete folder", "d", True),
+            ]
+
+        def done(action: str | None) -> None:
+            if action is not None:
+                getattr(self, f"action_{action}")()
+
+        self.push_screen(ActionMenu(title, items), done)
+
     # ----- study
 
     def _start(self, cram: bool) -> None:
@@ -789,4 +878,10 @@ class FlashcardApp(App[None]):
         # main-screen actions shouldn't fire while a modal/study screen is active
         if action in self.MAIN_ACTIONS and len(self.screen_stack) > 1:
             return False
+        # a key whose main-page button is greyed out is dimmed in the footer and does nothing
+        try:
+            if self.query_one(f"#btn-{action}", Button).disabled:
+                return None
+        except NoMatches:
+            pass
         return True

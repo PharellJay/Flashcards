@@ -6,19 +6,38 @@
       "name": "/",
       "parent_id": null,
       "children": [
-        "32fa242e024b"
+        "6dc4a79fa757"
       ],
       "cards": []
     },
     {
       "id": "32fa242e024b",
       "name": "Mathe",
-      "parent_id": "root",
+      "parent_id": "6dc4a79fa757",
       "children": [],
       "cards": [
         "ff498a876aa6",
         "caad4ae49b73"
       ]
+    },
+    {
+      "id": "6dc4a79fa757",
+      "name": "Test",
+      "parent_id": "root",
+      "children": [
+        "32fa242e024b",
+        "7eed13fc1e86"
+      ],
+      "cards": [
+        "194e708baca6"
+      ]
+    },
+    {
+      "id": "7eed13fc1e86",
+      "name": "Test",
+      "parent_id": "6dc4a79fa757",
+      "children": [],
+      "cards": []
     }
   ],
   "cards": [
@@ -27,13 +46,20 @@
       "folder_id": "32fa242e024b",
       "front": "1+1 = ?",
       "back": "2",
-      "due": false
+      "due": true
     },
     {
       "id": "caad4ae49b73",
       "folder_id": "32fa242e024b",
       "front": "1 + 2 = ?",
       "back": "3",
+      "due": true
+    },
+    {
+      "id": "194e708baca6",
+      "folder_id": "6dc4a79fa757",
+      "front": "3 + 3 = ?",
+      "back": "6",
       "due": true
     }
   ]
