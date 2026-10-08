@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from collections.abc import Callable
 
 from rich.text import Text
 from textual import events, on
@@ -22,6 +23,7 @@ from textual.widgets import (
     TextArea,
     Tree,
 )
+from textual.widgets._header import HeaderIcon, HeaderTitle
 from textual.widgets.option_list import Option
 from textual.widgets.tree import TreeNode
 
@@ -36,15 +38,30 @@ def _one_line(text: str, width: int = 60) -> str:
 # ---------------------------------------------------------------- modals
 
 
+def _rejected(screen: Screen, check: Callable[..., object] | None, *values: str) -> bool:
+    """Run a dialog's check; if it fails, show why and keep the dialog (and its input) open."""
+    if check is None:
+        return False
+    try:
+        check(*values)
+    except StoreError as exc:
+        screen.notify(str(exc), severity="error")
+        return True
+    return False
+
+
 class TextPrompt(ModalScreen[str | None]):
     """Ask for a single line of text (folder names)."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
-    def __init__(self, title: str, value: str = "") -> None:
+    def __init__(
+        self, title: str, value: str = "", check: Callable[[str], object] | None = None
+    ) -> None:
         super().__init__()
         self.prompt_title = title
         self.value = value
+        self.check = check
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="dialog"):
@@ -57,7 +74,9 @@ class TextPrompt(ModalScreen[str | None]):
     @on(Input.Submitted)
     @on(Button.Pressed, "#ok")
     def submit(self) -> None:
-        self.dismiss(self.query_one("#text", Input).value)
+        value = self.query_one("#text", Input).value
+        if not _rejected(self, self.check, value):
+            self.dismiss(value)
 
     @on(Button.Pressed, "#cancel")
     def action_cancel(self) -> None:
@@ -110,7 +129,9 @@ class CreateFolderDialog(ModalScreen[tuple[str, str] | None]):
     @on(Input.Submitted)
     @on(Button.Pressed, "#create")
     def submit(self) -> None:
-        self.dismiss((self.parent_id, self.query_one("#name", Input).value))
+        name = self.query_one("#name", Input).value
+        if not _rejected(self, self.store.check_name, self.parent_id, name):
+            self.dismiss((self.parent_id, name))
 
     @on(Button.Pressed, "#cancel")
     def action_cancel(self) -> None:
@@ -149,9 +170,9 @@ class CardForm(ModalScreen[tuple[str, str] | None]):
 
     @on(Button.Pressed, "#save")
     def action_save(self) -> None:
-        self.dismiss(
-            (self.query_one("#front", TextArea).text, self.query_one("#back", TextArea).text)
-        )
+        front, back = self.query_one("#front", TextArea).text, self.query_one("#back", TextArea).text
+        if not _rejected(self, Store.check_front, front):
+            self.dismiss((front, back))
 
     @on(Button.Pressed, "#cancel")
     def action_cancel(self) -> None:
@@ -162,6 +183,8 @@ class Confirm(ModalScreen[bool]):
     BINDINGS = [
         Binding("escape,n", "no", "No"),
         Binding("y", "yes", "Yes"),
+        Binding("left,up", "app.focus_previous", "Previous", show=False),
+        Binding("right,down", "app.focus_next", "Next", show=False),
     ]
 
     def __init__(self, message: str) -> None:
@@ -240,10 +263,13 @@ class ActionMenu(ModalScreen[str | None]):
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
-    def __init__(self, title: str, items: list[tuple[str, str, str, bool]]) -> None:
+    def __init__(
+        self, title: str, items: list[tuple[str, str, str, bool]], initial: str | None = None
+    ) -> None:
         super().__init__()
         self.menu_title = title
         self.items = items
+        self.initial = initial  # action to highlight first
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="dialog menu"):
@@ -256,6 +282,19 @@ class ActionMenu(ModalScreen[str | None]):
                 id="menu",
             )
 
+    def on_mount(self) -> None:
+        actions = [action for action, *_ in self.items]
+        if self.initial in actions:
+            self.query_one("#menu", OptionList).highlighted = actions.index(self.initial)
+
+    def on_key(self, event: events.Key) -> None:
+        # the key shown next to an item picks it (case-sensitive: m and M are different items)
+        for action, _, key, enabled in self.items:
+            if key and enabled and event.character == key:
+                event.stop()
+                self.dismiss(action)
+                return
+
     def on_click(self, event: events.Click) -> None:
         if event.widget is self:  # clicked outside the menu
             self.dismiss(None)
@@ -266,6 +305,96 @@ class ActionMenu(ModalScreen[str | None]):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+class ShareCodeDialog(ModalScreen[None]):
+    """Show a folder's share code (already copied to the clipboard)."""
+
+    BINDINGS = [Binding("escape", "close", "Close")]
+
+    def __init__(self, folder_name: str, code: str) -> None:
+        super().__init__()
+        self.folder_name = folder_name
+        self.code = code
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog wide"):
+            yield Label(f"Export {self.folder_name} (with subfolders)", classes="dialog-title")
+            yield Static(
+                "Copied to the clipboard. Send this code to someone; they add it with "
+                "[b]⇩ Import[/b] in the Folders panel. If your terminal didn't copy it, select it below."
+            )
+            yield TextArea(self.code, read_only=True, soft_wrap=True, id="code", classes="card-text")
+            with Horizontal(classes="buttons"):
+                yield Button("Close", variant="primary", id="close")
+
+    def on_mount(self) -> None:
+        self.query_one("#close", Button).focus()
+
+    @on(Button.Pressed, "#close")
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
+class ImportDialog(ModalScreen[str | None]):
+    """Paste a share code; returns it once it decodes."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("ctrl+s", "import", "Import", priority=True),
+    ]
+
+    def __init__(self, where: str) -> None:
+        super().__init__()
+        self.where = where
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog wide"):
+            yield Label(f"Import into {self.where}", classes="dialog-title")
+            yield Static("Paste a share code (ctrl+shift+v or right-click → paste in most terminals)")
+            yield TextArea(soft_wrap=True, id="code", classes="card-text")
+            yield Label("[dim]ctrl+s to import · esc to cancel[/]")
+            with Horizontal(classes="buttons"):
+                yield Button("Import", variant="primary", id="import")
+                yield Button("Cancel", id="cancel")
+
+    @on(Button.Pressed, "#import")
+    def action_import(self) -> None:
+        code = self.query_one("#code", TextArea).text
+        if not _rejected(self, Store.decode_share_code, code):
+            self.dismiss(code)
+
+    @on(Button.Pressed, "#cancel")
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ---------------------------------------------------------------- header
+
+
+class QuitButton(Static):
+    """Close button in the top-right corner of the header."""
+
+    DEFAULT_CSS = """
+    QuitButton { dock: right; width: auto; padding: 0 1; }
+    QuitButton:hover { background: $error; }
+    """
+
+    def __init__(self) -> None:
+        super().__init__("✕ Quit [dim](q)[/]")
+        self.tooltip = "Quit (q)"
+
+    def on_click(self) -> None:
+        self.app.exit()
+
+
+class AppHeader(Header):
+    """The header with a quit button where the (unused) clock would go."""
+
+    def compose(self) -> ComposeResult:
+        yield HeaderIcon().data_bind(Header.icon)
+        yield HeaderTitle()
+        yield QuitButton()
 
 
 # ---------------------------------------------------------------- right-click menus
@@ -306,18 +435,25 @@ class StudyScreen(Screen[None]):
         Binding("1", "grade(1)", "Again", show=False),
         Binding("2", "grade(2)", "Done", show=False),
         Binding("right", "next", "Next", show=False),
+        Binding("u", "undo", "Undo"),
     ]
 
-    def __init__(self, store: Store, cards: list[Card], cram: bool, title: str) -> None:
+    def __init__(
+        self, store: Store, cards: list[Card], cram: bool, title: str, mode: str, reverse: bool = False
+    ) -> None:
         super().__init__()
         self.store = store
         self.queue = list(cards)
         self.cram = cram
         self.study_title = title
+        self.mode = mode  # "Review" or "Cram", for the sub-title
+        self.reverse = reverse  # show the back first and answer with the front
         self.total = len(cards)
         self.done = 0
         self.revealed = False
         self.tally = {AGAIN: 0, DONE: 0}
+        # snapshots taken before each grade / "next": (queue, done, tally, card id, due, misses)
+        self.history: list[tuple[list[Card], int, dict[int, int], str, bool, int]] = []
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -335,15 +471,19 @@ class StudyScreen(Screen[None]):
         yield Footer()
 
     def on_mount(self) -> None:
-        mode = "Cram" if self.cram else "Review"
-        self.sub_title = f"{mode} · {self.study_title}"
         self.show_card()
+
+    def update_sub_title(self) -> None:
+        reversed_ = " · reversed" if self.reverse else ""
+        self.sub_title = f"{self.mode}{reversed_} · {self.study_title}"
 
     @property
     def current(self) -> Card | None:
         return self.queue[0] if self.queue else None
 
     def show_card(self) -> None:
+        self.update_sub_title()
+        self.refresh_bindings()  # "Undo" only shows when there is something to undo
         progress = self.query_one("#progress", Static)
         front = self.query_one("#front", Static)
         back = self.query_one("#back", Static)
@@ -369,8 +509,9 @@ class StudyScreen(Screen[None]):
             f"[dim]{self.store.path_of(card.folder_id)}[/]   "
             f"{remaining} card(s) left · {self.done} done"
         )
-        front.update(Text(card.front))
-        back.update(Text(card.back or "(empty)"))
+        prompt, answer = (card.back, card.front) if self.reverse else (card.front, card.back)
+        front.update(Text(prompt or "(empty)"))
+        back.update(Text(answer or "(empty)"))
         back.display = self.revealed
         if not self.revealed:
             hint.update("[b]space[/]/[b]click[/] show answer")
@@ -394,8 +535,12 @@ class StudyScreen(Screen[None]):
         elif self.cram:
             self.action_next()
 
+    def _snapshot(self, card: Card) -> None:
+        self.history.append((list(self.queue), self.done, dict(self.tally), card.id, card.due, card.misses))
+
     def action_next(self) -> None:
         if self.cram and self.revealed and self.current is not None:
+            self._snapshot(self.current)
             self.queue.pop(0)
             self.done += 1
             self.revealed = False
@@ -405,6 +550,7 @@ class StudyScreen(Screen[None]):
         card = self.current
         if self.cram or card is None or not self.revealed:
             return
+        self._snapshot(card)
         self.store.review(card.id, grade)
         self.tally[grade] += 1
         self.done += 1
@@ -414,6 +560,21 @@ class StudyScreen(Screen[None]):
             self.queue.insert(min(len(self.queue), 3), card)
         self.revealed = False
         self.show_card()
+
+    def action_undo(self) -> None:
+        """Step back to the previous card, showing its answer so it can be graded again."""
+        if not self.history:
+            return
+        self.queue, self.done, self.tally, card_id, due, misses = self.history.pop()
+        if not self.cram:
+            self.store.set_card_state(card_id, due, misses)
+        self.revealed = True
+        self.show_card()
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action == "undo":
+            return bool(self.history)
+        return True
 
     def action_leave(self) -> None:
         self.dismiss(None)
@@ -429,13 +590,22 @@ class FlashcardApp(App[None]):
     CSS = """
     #main { height: 1fr; }
     #left { width: 40%; min-width: 28; }
-    #folders { height: 1fr; border: round $primary-darken-2; }
+    /* the panel (border and button row) takes the tree's grey, including its tint while focused */
+    #folder-panel { height: 1fr; border: round $primary-darken-2; background: $surface; }
+    #folder-panel:focus-within { border: round $accent; background-tint: $foreground 5%; }
+    /* fold button top-right above the tree; Import | Export along the bottom of the panel */
+    #folder-head { height: 1; align-horizontal: right; }
+    #folder-foot { height: 1; grid-size: 2; grid-gutter: 0 1; }
+    #folder-foot Button { width: 1fr; min-width: 0; }
+    #folder-panel:focus-within Button { background-tint: $foreground 5%; }
+    #folders { height: 1fr; }
     .toolbar { height: auto; grid-size: 1; grid-rows: 3; grid-gutter: 0 1; padding: 0 1; }
     #study-bar { grid-size: 3; }
     .toolbar Button { width: 1fr; min-width: 0; }
     /* short terminals: compact one-line buttons so the card list keeps its space */
     Screen.-short .toolbar { grid-rows: 1; grid-gutter: 1 1; margin-bottom: 1; }
-    #folders:focus-within { border: round $accent; }
+    /* wide terminals: folder buttons side by side, leaving more rows for the tree */
+    Screen.-wide #folder-bar { grid-size: 2; }
     #right { width: 1fr; }
     #info { height: auto; padding: 0 1; border: round $primary-darken-2; }
     #cards { height: 1fr; min-height: 5; border: round $primary-darken-2; }
@@ -471,22 +641,29 @@ class FlashcardApp(App[None]):
     #grades Button { margin: 0 1; }
     """
 
-    # the footer lists the keys for the main-page buttons; folder/card actions (rename, move,
+    # the footer is one line, so labels are short enough to fit 80 columns (quit is in the header);
+    # it lists the keys for the main-page buttons; folder/card actions (rename, move,
     # edit, delete) live in the options menu (o / right-click) and keep hidden shortcuts
     BINDINGS = [
         Binding("s", "study", "Study"),
         Binding("c", "cram", "Cram"),
         Binding("f,f5", "make_due", "Refresh", key_display="f"),
-        Binding("a", "add_card", "Add card"),
-        Binding("n", "create_folder", "New folder"),
+        Binding("a", "add_card", "Card"),
+        Binding("n", "create_folder", "Folder"),
         Binding("o", "options", "Options"),
+        # one key, two footer labels: check_action shows whichever matches the button
+        Binding("z", "collapse_folders", "Collapse"),
+        Binding("z", "expand_folders", "Expand"),
+        Binding("i", "import_folder", "Import"),
+        Binding("x", "export_folder", "Export"),
         Binding("r", "rename_folder", "Rename", show=False),
         Binding("m", "move_folder", "Move folder", show=False),
         Binding("e", "edit_card", "Edit card", show=False),
         Binding("M", "move_card", "Move card", show=False),
         Binding("d", "delete", "Delete", show=False),
         Binding("R", "make_all_due", "Refresh all", show=False),
-        Binding("q", "quit", "Quit"),
+        Binding("ctrl+z", "undo_delete", "Undo delete"),
+        Binding("q", "quit", "Quit", show=False),
     ]
 
     # main-screen actions (everything bound above except quit)
@@ -495,6 +672,10 @@ class FlashcardApp(App[None]):
     def __init__(self, store: Store) -> None:
         super().__init__()
         self.store = store
+        self._saved_expanded = set(store.expanded)
+        self.reverse = False  # last side choice (back first?), pre-selected next time
+        self._undo_delete: Callable[[], object] | None = None  # restores the last deletion
+        self._undo_label = ""
 
     # ----- layout
 
@@ -507,13 +688,25 @@ class FlashcardApp(App[None]):
         return button
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield AppHeader()
         with Horizontal(id="main"):
             with Vertical(id="left"):
-                tree = FolderTree("All folders", data=ROOT_ID, id="folders")
-                tree.border_title = "Folders"
-                tree.auto_expand = False
-                yield tree
+                with Vertical(id="folder-panel") as panel:
+                    panel.border_title = "Folders"
+                    with Horizontal(id="folder-head"):
+                        fold = self._tool("⊟ Collapse all", "toggle_folders", "Collapse or expand every folder (z)")
+                        fold.compact = True
+                        yield fold
+                    tree = FolderTree("All folders", data=ROOT_ID, id="folders")
+                    tree.auto_expand = False
+                    yield tree
+                    with Grid(id="folder-foot"):
+                        for button in (
+                            self._tool("⇩ Import", "import_folder", "Add folders from a share code (i)"),
+                            self._tool("⇪ Export", "export_folder", "Copy a share code for the selected folder and its subfolders, or all folders (x)"),
+                        ):
+                            button.compact = True
+                            yield button
                 with Grid(id="folder-bar", classes="toolbar"):
                     yield self._tool("+ New folder", "create_folder", "Create a folder (n)")
                     yield self._tool("⋯ Options", "options", "More actions for the selected folder or card (o / right-click)")
@@ -531,7 +724,7 @@ class FlashcardApp(App[None]):
                 preview = Static(id="preview")
                 preview.border_title = "Preview"
                 yield preview
-        yield Footer()
+        yield Footer(compact=True, show_command_palette=False)
 
     def on_resize(self, event: events.Resize) -> None:
         short = event.size.height < 30  # matches the "-short" breakpoint
@@ -539,8 +732,13 @@ class FlashcardApp(App[None]):
             button.compact = short
 
     def on_mount(self) -> None:
-        self.refresh_tree(ROOT_ID)
+        self.refresh_tree(ROOT_ID, expanded=self.store.expanded)
         self.query_one(Tree).focus()
+
+    def on_unmount(self) -> None:
+        # store.expanded follows the tree in memory; it's written once here, not on every toggle
+        if self.store.expanded != self._saved_expanded:
+            self.store.save()
 
     # ----- helpers
 
@@ -572,16 +770,27 @@ class FlashcardApp(App[None]):
             label.append(f" ·{due} due", style="green")
         return label
 
-    def refresh_tree(self, select_id: str | None = None, select_card: str | None = None) -> None:
-        tree = self.tree
-        select_id = select_id or self.selected_folder()
-        expanded = {ROOT_ID}
-        stack = [tree.root]
+    def _expanded_ids(self) -> set[str]:
+        """Ids of the open folders below "All folders"."""
+        expanded = set()
+        stack = list(self.tree.root.children)
         while stack:
             node = stack.pop()
-            if node.is_expanded and node.data:
+            if node.is_expanded and node.children:
                 expanded.add(node.data)
             stack.extend(node.children)
+        return expanded
+
+    def refresh_tree(
+        self,
+        select_id: str | None = None,
+        select_card: str | None = None,
+        expanded: set[str] | None = None,
+    ) -> None:
+        """Rebuild the tree, keeping open folders open (or opening `expanded` instead)."""
+        tree = self.tree
+        select_id = select_id or self.selected_folder()
+        expanded = set(self._expanded_ids() if expanded is None else expanded)
         # make sure the selected folder is visible
         cur = self.store.folders.get(select_id)
         while cur is not None and cur.parent_id is not None:
@@ -605,6 +814,7 @@ class FlashcardApp(App[None]):
 
         build(tree.root, ROOT_ID)
         tree.root.expand()
+        self.update_fold_button()
         self.call_after_refresh(tree.move_cursor, target)
         self.refresh_right(target.data, select_card)
 
@@ -624,7 +834,14 @@ class FlashcardApp(App[None]):
         if f.cards:
             cards = [self.store.cards[cid] for cid in f.cards]
             ol.add_options(
-                Option(Text.assemble(("● ", "green") if c.due else "  ", _one_line(c.front)), id=c.id)
+                Option(
+                    Text.assemble(
+                        ("● ", "green") if c.due else "  ",
+                        _one_line(c.front),
+                        (f"  ✗{c.misses}", "dim red") if c.misses else "",
+                    ),
+                    id=c.id,
+                )
                 for c in cards
             )
             ol.highlighted = f.cards.index(select_card) if select_card in f.cards else 0
@@ -643,6 +860,7 @@ class FlashcardApp(App[None]):
             preview.update(
                 Text.assemble(("Front: ", "bold"), card.front, "\n", ("Back:  ", "bold"), card.back)
                 + Text("\ndue" if card.due else "\ndone — refresh to study it again", style="dim")
+                + Text(f" · missed {card.misses}×" if card.misses else "", style="dim red")
             )
 
     def update_folder_buttons(self, folder_id: str, due: int, total: int) -> None:
@@ -655,6 +873,20 @@ class FlashcardApp(App[None]):
         self.query_one("#btn-cram", Button).disabled = total == 0
         self.query_one("#btn-make_due", Button).disabled = due == total
         self.refresh_bindings()  # the footer dims keys whose button is disabled
+
+    def _any_expanded(self) -> bool:
+        """True if any folder below "All folders" is showing its subfolders."""
+        return bool(self._expanded_ids())
+
+    def _has_subfolders(self) -> bool:
+        return any(node.children for node in self.tree.root.children)
+
+    def update_fold_button(self) -> None:
+        button = self.query_one("#btn-toggle_folders", Button)
+        button.label = "⊟ Collapse all" if self._any_expanded() else "⊞ Expand all"
+        # nothing to fold when no folder has subfolders
+        button.disabled = not self._has_subfolders()
+        self.refresh_bindings()
 
     def _try(self, fn, *args):
         """Run a store operation; show its error and return None if it fails.
@@ -674,6 +906,12 @@ class FlashcardApp(App[None]):
     def folder_highlighted(self, event: Tree.NodeHighlighted[str]) -> None:
         self.refresh_right(event.node.data)
 
+    @on(Tree.NodeExpanded, "#folders")
+    @on(Tree.NodeCollapsed, "#folders")
+    def folder_toggled(self) -> None:
+        self.store.expanded = self._expanded_ids()
+        self.update_fold_button()
+
     @on(OptionList.OptionHighlighted, "#cards")
     def card_highlighted(self) -> None:
         self.update_preview()
@@ -683,6 +921,25 @@ class FlashcardApp(App[None]):
         self.action_edit_card()
 
     # ----- folder actions
+
+    def action_toggle_folders(self) -> None:
+        if self._any_expanded():
+            self.action_collapse_folders()
+        else:
+            self.action_expand_folders()
+
+    def action_expand_folders(self) -> None:
+        self.tree.root.expand_all()
+
+    def action_collapse_folders(self) -> None:
+        tree = self.tree
+        # keep the cursor on the selected folder's top-level ancestor, which stays visible
+        node = tree.cursor_node
+        while node is not None and node.parent is not None and node.parent is not tree.root:
+            node = node.parent
+        for child in tree.root.children:
+            child.collapse_all()
+        self.call_after_refresh(tree.move_cursor, node)
 
     def action_create_folder(self) -> None:
         def done(result: tuple[str, str] | None) -> None:
@@ -701,7 +958,9 @@ class FlashcardApp(App[None]):
             if name is not None and self._try(self.store.rename_folder, fid, name):
                 self.refresh_tree(fid)
 
-        self.push_screen(TextPrompt("Rename folder", self.store.folders[fid].name), done)
+        folder = self.store.folders[fid]
+        check = lambda name: self.store.check_name(folder.parent_id, name, exclude=fid)  # noqa: E731
+        self.push_screen(TextPrompt("Rename folder", folder.name, check), done)
 
     def action_move_folder(self) -> None:
         fid = self.selected_folder()
@@ -773,7 +1032,12 @@ class FlashcardApp(App[None]):
 
         def done(ok: bool | None) -> None:
             if ok:
-                self.store.delete_card(card.id)
+                removed = self.store.delete_card(card.id)
+                self._remember_delete(
+                    f"card '{_one_line(card.front, 30)}'",
+                    lambda: self.store.restore_card(*removed),
+                    card.folder_id, card.id,
+                )
                 self.refresh_tree()
 
         self.push_screen(Confirm(f"Delete card '{_one_line(card.front, 40)}'?"), done)
@@ -790,7 +1054,10 @@ class FlashcardApp(App[None]):
 
         def done(ok: bool | None) -> None:
             if ok:
-                self.store.delete_folder(fid)
+                removed = self.store.delete_folder(fid)
+                self._remember_delete(
+                    f"folder '{f.name}'", lambda: self.store.restore_folder(*removed), fid
+                )
                 self.refresh_tree(parent)
 
         self.push_screen(
@@ -799,6 +1066,51 @@ class FlashcardApp(App[None]):
             ),
             done,
         )
+
+    def _remember_delete(
+        self, label: str, restore: Callable[[], object], folder_id: str, card_id: str | None = None
+    ) -> None:
+        """Keep the last deletion so ctrl+z can put it back."""
+
+        def undo() -> None:
+            restore()
+            self.refresh_tree(folder_id, select_card=card_id)
+
+        self._undo_delete, self._undo_label = undo, label
+        self.notify(f"Deleted {label} — ctrl+z to undo")
+        self.refresh_bindings()
+
+    def action_undo_delete(self) -> None:
+        if self._undo_delete is None:
+            return
+        if self._try(self._undo_delete):
+            self.notify(f"Restored {self._undo_label}")
+            self._undo_delete = None
+            self.refresh_bindings()
+
+    # ----- sharing
+
+    def action_export_folder(self) -> None:
+        fid = self.selected_folder()
+        code = self._try(self.store.export_folder, fid)
+        if not code:
+            return
+        self.copy_to_clipboard(code)
+        what = "all folders" if fid == ROOT_ID else f"'{self.store.folders[fid].name}'"
+        self.push_screen(ShareCodeDialog(what, code))
+
+    def action_import_folder(self) -> None:
+        fid = self.selected_folder()
+        where = "the top level" if fid == ROOT_ID else self.store.path_of(fid)
+
+        def done(code: str | None) -> None:
+            if code is not None and (result := self._try(self.store.import_folder, fid, code)):
+                folders, n = result
+                self.refresh_tree(folders[0].id)
+                names = ", ".join(f"'{f.name}'" for f in folders)
+                self.notify(f"Imported {names} ({n} card(s))")
+
+        self.push_screen(ImportDialog(where), done)
 
     # ----- options menu
 
@@ -811,6 +1123,7 @@ class FlashcardApp(App[None]):
                 ("edit_card", "✎ Edit", "e", True),
                 ("move_card", "→ Move to…", "M", True),
                 ("delete_card", "✕ Delete", "d", True),
+                ("reset_misses", f"↺ Reset misses ({card.misses})", "", card.misses > 0),
             ]
         else:
             fid = self.selected_folder()
@@ -829,20 +1142,39 @@ class FlashcardApp(App[None]):
 
         self.push_screen(ActionMenu(title, items), done)
 
+    def action_reset_misses(self) -> None:
+        card = self.selected_card()
+        if card is not None:
+            self.store.reset_misses(card.id)
+            self.refresh_right(card.folder_id, select_card=card.id)
+
     # ----- study
 
     def _start(self, cram: bool) -> None:
         fid = self.selected_folder()
         cards = self.store.study_cards(fid) if cram else self.store.due_cards(fid)
+        mode = "Cram" if cram else "Review"
         if not cards:
             msg = "No cards here yet." if cram else "Nothing due here — try cram (c)."
             self.notify(msg, severity="warning")
             return
         random.shuffle(cards)
-        self.push_screen(
-            StudyScreen(self.store, cards, cram, self.store.path_of(fid)),
-            lambda _: self.refresh_tree(fid),
-        )
+
+        def side_chosen(side: str | None) -> None:
+            if side is None:
+                return
+            self.reverse = side == "back"
+            self.push_screen(
+                StudyScreen(self.store, cards, cram, self.store.path_of(fid), mode, self.reverse),
+                lambda _: self.refresh_tree(fid),
+            )
+
+        sides = [
+            ("front", "Front → answer with the back", "f", True),
+            ("back", "Back → answer with the front", "b", True),
+        ]
+        initial = "back" if self.reverse else "front"
+        self.push_screen(ActionMenu(f"{mode}: which side to train?", sides, initial), side_chosen)
 
     # ----- refresh
 
@@ -878,6 +1210,13 @@ class FlashcardApp(App[None]):
         # main-screen actions shouldn't fire while a modal/study screen is active
         if action in self.MAIN_ACTIONS and len(self.screen_stack) > 1:
             return False
+        if action == "undo_delete":
+            return self._undo_delete is not None
+        # `z` shows "Collapse all" or "Expand all" in the footer, matching the fold button
+        if action in ("collapse_folders", "expand_folders"):
+            if not self._has_subfolders():
+                return None if action == "collapse_folders" else False
+            return self._any_expanded() == (action == "collapse_folders")
         # a key whose main-page button is greyed out is dimmed in the footer and does nothing
         try:
             if self.query_one(f"#btn-{action}", Button).disabled:
